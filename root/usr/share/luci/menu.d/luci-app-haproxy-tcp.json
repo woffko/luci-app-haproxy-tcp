@@ -1,0 +1,15 @@
+{
+	"admin/services/haproxy-tcp": {
+		"title": "HAProxy TCP",
+		"order": 55,
+		"action": {
+			"type": "view",
+			"path": "haproxy-tcp"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-haproxy-tcp"
+			]
+		}
+	}
+}

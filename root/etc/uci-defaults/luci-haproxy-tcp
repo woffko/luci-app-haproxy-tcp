@@ -1,10 +1,5 @@
 #!/bin/sh
 
-[ ! -f /usr/sbin/haproxy-tcp ] && ln -sf haproxy /usr/sbin/haproxy-tcp
-
-/etc/init.d/haproxy stop
-/etc/init.d/haproxy disable
-
 /etc/init.d/haproxy-tcp enable
 
 exit 0

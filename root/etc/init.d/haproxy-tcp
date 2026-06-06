@@ -4,106 +4,327 @@ START=85
 NAME=haproxy-tcp
 USE_PROCD=1
 
-uci_get_by_type() {
-	local ret=$(uci get $NAME.@$1[0].$2 2>/dev/null)
-	echo ${ret:=$3}
-}
+HAPROXY_BIN="/usr/sbin/haproxy"
+CONFIG_FILE="/var/etc/${NAME}.cfg"
+PID_FILE="/var/run/${NAME}.pid"
+CONFIG_SECTION=""
+RUN_USER="nobody"
+RUN_GROUP="nogroup"
 
-uci_bool_by_type() {
-	case "$(uci_get_by_type $1 $2)" in
-	1 | on | true | yes | enabled) return 0 ;;
-	esac
-	return 1
-}
+. /lib/functions.sh
 
-start_instance() {
-	procd_open_instance
-	procd_set_param respawn
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_set_param term_timeout 3
-	procd_set_param nice -5
-	procd_set_param limits nofile="65535 65535"
-	[ -e /proc/sys/kernel/core_pattern ] && {
-		procd_append_param limits core="unlimited"
-	}
-	procd_set_param command $@
-	procd_close_instance
+config_cb() {
+	[ "$1" = "$NAME" ] && CONFIG_SECTION="$2"
 }
 
 service_triggers() {
-	procd_add_reload_trigger $NAME
+	procd_add_reload_trigger "$NAME"
 }
 
-genline_srv() {
-	local line="$1"
-	local addr="$(echo -n $line | awk '{print $1}')"
-	local pedding_len=$((32 - $(echo $addr | wc -c) - 2))
-	[ $pedding_len -lt 1 ] && pedding_len=1
-	local uuid="$(echo -n $line | md5sum | cut -c1-$pedding_len)"
-	echo "    server ${uuid}__${addr}    $line" | tr -d "\'"
+fail() {
+	logger -t "$NAME" "$1"
+	return 1
 }
 
-boot() {
-	local delay=$(uci_get_by_type $NAME startup_delay)
-	(sleep ${delay:-0} && start >/dev/null 2>&1) &
+load_config() {
+	CONFIG_SECTION=""
+	config_load "$NAME"
+	[ -n "$CONFIG_SECTION" ]
+}
+
+is_uint() {
+	case "$1" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+
 	return 0
 }
 
-start_service() {
-	uci_bool_by_type $NAME enable || exit 0
-	local listen=$(uci_get_by_type $NAME listen :6666)
-	local stats=$(uci_get_by_type $NAME stats :7777)
-	local retries=$(uci_get_by_type $NAME retries 1)
-	local timeout=$(uci_get_by_type $NAME timeout 999)
-
-	mkdir -p /var/etc
-	cat <<-EOF >/var/etc/$NAME.cfg
-		defaults
-		    mode tcp
-		    retries ${retries:-2}
-		    timeout connect ${timeout}ms
-		    timeout client ${timeout}ms
-		    timeout server ${timeout}ms
-
-		listen stats
-		    bind ${stats}
-		    mode http
-		    stats uri /
-		    stats refresh 10s
-
-		frontend tcp-in
-		    bind ${listen}
-		    default_backend tcp-out
-
-		backend tcp-out
-		$(uci_get_by_type $NAME upstreams | grep -q 'weight' && echo "    balance static-rr")
-		$(
-			IFS=$'\n'
-			for upstream in $(uci_get_by_type $NAME upstreams | awk -F"'" -v OFS="\n" '{$1=$1}1' | sed '/^[ \t]*$/d'); do
-				if echo $upstream | grep -q 'weight'; then
-					genline_srv "$upstream"
-				else
-					IFS=' '
-					for it in $upstream; do
-						genline_srv "$it"
-					done
-				fi
-			done
-		)
-
-	EOF
-
-	[ ${timeout} -lt 0 ] && sed '/ timeout /d' -i /var/etc/$NAME.cfg
-
-	start_instance /usr/sbin/$NAME -q -f /var/etc/$NAME.cfg -p /var/run/$NAME.pid
+is_port() {
+	is_uint "$1" || return 1
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-kill_all() {
-	kill -9 $(pgrep -f $@) >/dev/null 2>&1
+is_range() {
+	is_uint "$1" || return 1
+	[ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+is_safe_text() {
+	case "$1" in
+		*"'"*|*\"*|*\\*|*"#"*|*";"*) return 1 ;;
+	esac
+
+	! printf '%s' "$1" | grep -q '[[:cntrl:]]'
+}
+
+validate_endpoint() {
+	local endpoint="$1"
+	local host=""
+	local port=""
+
+	is_safe_text "$endpoint" || return 1
+
+	case "$endpoint" in
+		:* )
+			port="${endpoint#:}"
+			;;
+		\*:* )
+			port="${endpoint#*:}"
+			;;
+		\[*\]:* )
+			host="${endpoint%%]:*}"
+			host="${host#[}"
+			port="${endpoint##*:}"
+
+			case "$host" in
+				""|*[!0-9A-Fa-f:.]*) return 1 ;;
+			esac
+			;;
+		*:* )
+			host="${endpoint%:*}"
+			port="${endpoint##*:}"
+
+			case "$host" in
+				""|*:*|*[!A-Za-z0-9_.-]*) return 1 ;;
+			esac
+			;;
+		* )
+			return 1
+			;;
+	esac
+
+	is_port "$port"
+}
+
+validate_bind() {
+	case "$1" in
+		*" "*) return 1 ;;
+	esac
+
+	validate_endpoint "$1"
+}
+
+validate_stats_auth() {
+	local user="${1%%:*}"
+	local password="${1#*:}"
+
+	is_safe_text "$1" || return 1
+
+	case "$1" in
+		*" "*|*:|:*) return 1 ;;
+		*:*) ;;
+		*) return 1 ;;
+	esac
+
+	case "$password" in
+		*:*) return 1 ;;
+	esac
+
+	[ -n "$user" ] && [ -n "$password" ]
+}
+
+validate_upstream() {
+	local endpoint=""
+	local weight=""
+
+	is_safe_text "$1" || return 1
+
+	set -f
+	set -- $1
+	set +f
+
+	case "$#" in
+		1)
+			endpoint="$1"
+			;;
+		3)
+			endpoint="$1"
+			[ "$2" = "weight" ] || return 1
+			weight="$3"
+			is_range "$weight" 1 256 || return 1
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	case "$endpoint" in
+		\*:*) return 1 ;;
+	esac
+
+	validate_endpoint "$endpoint"
+}
+
+append_server() {
+	local upstream="$1"
+
+	validate_upstream "$upstream" || {
+		VALID_CONFIG=0
+		fail "Invalid upstream entry: $upstream"
+		return
+	}
+
+	SERVER_COUNT=$((SERVER_COUNT + 1))
+	printf '    server srv_%03d %s check\n' "$SERVER_COUNT" "$upstream" >> "$CONFIG_TMP"
+}
+
+write_config() {
+	local listen="$1"
+	local stats="$2"
+	local stats_enable="$3"
+	local stats_auth="$4"
+	local timeout="$5"
+	local retries="$6"
+	local old_umask=""
+
+	VALID_CONFIG=1
+	SERVER_COUNT=0
+
+	mkdir -p /var/etc /var/run
+	CONFIG_TMP="$(mktemp "/var/etc/${NAME}.cfg.XXXXXX")" || return 1
+	old_umask="$(umask)"
+	umask 077
+
+	{
+		cat <<-EOF
+		global
+		    log stdout format raw daemon
+		    maxconn 4096
+		    user ${RUN_USER}
+		    group ${RUN_GROUP}
+
+		defaults
+		    mode tcp
+		    option tcplog
+		    retries ${retries}
+		EOF
+
+		if [ "$timeout" != "-1" ]; then
+			cat <<-EOF
+			    timeout connect ${timeout}ms
+			    timeout client ${timeout}ms
+			    timeout server ${timeout}ms
+			EOF
+		fi
+
+		if [ "$stats_enable" = "1" ]; then
+			cat <<-EOF
+
+			listen stats
+			    bind ${stats}
+			    mode http
+			    stats enable
+			    stats uri /
+			    stats refresh 10s
+			EOF
+
+			if [ -n "$stats_auth" ]; then
+				printf '    stats auth %s\n' "$stats_auth"
+			fi
+		fi
+
+		cat <<-EOF
+
+		frontend tcp_in
+		    bind ${listen}
+		    default_backend tcp_out
+
+		backend tcp_out
+		    balance roundrobin
+		EOF
+	} > "$CONFIG_TMP"
+	umask "$old_umask"
+
+	config_list_foreach "$CONFIG_SECTION" upstreams append_server
+
+	if [ "$VALID_CONFIG" != "1" ] || [ "$SERVER_COUNT" -eq 0 ]; then
+		rm -f "$CONFIG_TMP"
+		[ "$SERVER_COUNT" -eq 0 ] && fail "At least one upstream server is required"
+		return 1
+	fi
+
+	if ! "$HAPROXY_BIN" -q -c -f "$CONFIG_TMP"; then
+		rm -f "$CONFIG_TMP"
+		fail "Generated HAProxy configuration failed validation"
+		return 1
+	fi
+
+	mv "$CONFIG_TMP" "$CONFIG_FILE"
+}
+
+start_service() {
+	local enabled="0"
+	local listen=":6666"
+	local stats_enable="0"
+	local stats="127.0.0.1:7777"
+	local stats_auth=""
+	local retries="1"
+	local timeout="999"
+
+	[ -x "$HAPROXY_BIN" ] || return 1
+	load_config || {
+		fail "Missing UCI section '$NAME'"
+		return 1
+	}
+
+	config_get_bool enabled "$CONFIG_SECTION" enable "0"
+	[ "$enabled" = "1" ] || return 0
+
+	config_get listen "$CONFIG_SECTION" listen ":6666"
+	config_get_bool stats_enable "$CONFIG_SECTION" stats_enable "0"
+	config_get stats "$CONFIG_SECTION" stats "127.0.0.1:7777"
+	config_get stats_auth "$CONFIG_SECTION" stats_auth ""
+	config_get retries "$CONFIG_SECTION" retries "1"
+	config_get timeout "$CONFIG_SECTION" timeout "999"
+
+	validate_bind "$listen" || {
+		fail "Invalid service bind address: $listen"
+		return 1
+	}
+
+	if [ "$stats_enable" = "1" ]; then
+		validate_bind "$stats" || {
+			fail "Invalid stats bind address: $stats"
+			return 1
+		}
+
+		if [ -n "$stats_auth" ]; then
+			validate_stats_auth "$stats_auth" || {
+				fail "Invalid stats authentication value"
+				return 1
+			}
+		fi
+	fi
+
+	is_range "$retries" 0 10 || {
+		fail "Retries must be between 0 and 10"
+		return 1
+	}
+
+	case "$timeout" in
+		-1) ;;
+		*)
+			is_range "$timeout" 0 86400000 || {
+				fail "Timeout must be -1 or 0..86400000"
+				return 1
+			}
+			;;
+	esac
+
+	write_config "$listen" "$stats" "$stats_enable" "$stats_auth" "$timeout" "$retries" || return 1
+
+	procd_open_instance
+	procd_set_param command "$HAPROXY_BIN" -db -f "$CONFIG_FILE" -p "$PID_FILE"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param term_timeout 5
+	procd_set_param limits nofile="65535 65535"
+	procd_set_param file "/etc/config/${NAME}"
+	procd_close_instance
 }
 
 stop_service() {
-	kill_all "$NAME.pid"
-	rm -rf /var/etc/$NAME.cfg
+	rm -f "$CONFIG_FILE"
 }
